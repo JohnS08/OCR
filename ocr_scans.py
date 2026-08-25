@@ -31,6 +31,12 @@ DEFAULT_OUTPUT_NAME = "РЕЗУЛЬТАТ"
 DEFAULT_DPI = 300
 DEFAULT_CONFIDENCE = 75.0
 DEFAULT_PSM = 3
+DEFAULT_TIMEOUT = 90
+DEFAULT_MAX_OCR_PIXELS = 12_000_000
+DEFAULT_FALLBACK_DPI = 150
+DEFAULT_FALLBACK_MAX_OCR_PIXELS = 5_000_000
+DEFAULT_FALLBACK_TIMEOUT = 60
+DEFAULT_TABLE_TIMEOUT = 45
 FONT_NAME = "OCRTextLayer"
 
 # Символы, характерные для математических выражений. Дефис отдельно не
@@ -68,6 +74,9 @@ class PageResult:
     recovered_table_words: int = 0
     uncertain_words: int = 0
     formula_lines: int = 0
+    fallback_pages: int = 0
+    pages_without_ocr: int = 0
+    table_timeouts: int = 0
 
 
 class UserFacingError(RuntimeError):
@@ -132,8 +141,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=180,
-        help="Максимальное число секунд OCR на одну страницу.",
+        default=DEFAULT_TIMEOUT,
+        help="Максимальное число секунд для основного OCR-прохода страницы.",
+    )
+    parser.add_argument(
+        "--table-timeout",
+        type=int,
+        default=DEFAULT_TABLE_TIMEOUT,
+        help="Максимальное число секунд для дополнительного OCR-прохода таблиц.",
+    )
+    parser.add_argument(
+        "--max-ocr-pixels",
+        type=int,
+        default=DEFAULT_MAX_OCR_PIXELS,
+        help="Максимальное число пикселей изображения для основного OCR-прохода.",
+    )
+    parser.add_argument(
+        "--fallback-dpi",
+        type=int,
+        default=DEFAULT_FALLBACK_DPI,
+        help="DPI повторного OCR после тайм-аута основного прохода.",
+    )
+    parser.add_argument(
+        "--fallback-max-ocr-pixels",
+        type=int,
+        default=DEFAULT_FALLBACK_MAX_OCR_PIXELS,
+        help="Максимальное число пикселей изображения при повторном OCR.",
     )
     parser.add_argument(
         "--overwrite",
@@ -250,14 +283,92 @@ def destination_for(input_pdf: Path, source_dir: Path, output_dir: Path) -> Path
     return output_dir / relative
 
 
-def render_page(page: fitz.Page, dpi: int) -> Image.Image:
-    """Рендерит страницу в RGB без альфа-канала для передачи Tesseract."""
+def render_page(page: fitz.Page, dpi: int, max_pixels: int) -> tuple[Image.Image, int]:
+    """Рендерит страницу для OCR, ограничивая её размер по числу пикселей.
+
+    Ограничение предотвращает передачу Tesseract чрезмерно больших страниц,
+    для которых анализ развёртки может занимать несколько минут. Оригинальная
+    PDF-страница при этом не меняется — уменьшается только временная копия OCR.
+    """
     zoom = dpi / 72.0
+    estimated_width = max(1, int(round(page.rect.width * zoom)))
+    estimated_height = max(1, int(round(page.rect.height * zoom)))
+    estimated_pixels = estimated_width * estimated_height
+    if estimated_pixels > max_pixels:
+        zoom *= (max_pixels / estimated_pixels) ** 0.5
+
     pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     try:
-        return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        effective_dpi = max(1, int(round(pixmap.width * 72.0 / page.rect.width)))
+        image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        return image, effective_dpi
     finally:
         pixmap = None
+
+
+def is_tesseract_timeout(error: RuntimeError) -> bool:
+    """Отделяет исчерпание лимита времени от других ошибок Tesseract."""
+    return "Tesseract process timeout" in str(error)
+
+
+def recognize_primary_with_recovery(
+    page: fitz.Page,
+    args: argparse.Namespace,
+    source_name: str,
+    page_number: int,
+    logger: logging.Logger,
+) -> tuple[Image.Image | None, list[OcrWord], int, bool]:
+    """Выполняет основной OCR, а при тайм-ауте — облегчённый повторный проход.
+
+    Если Tesseract исчерпал лимит и на облегчённой копии, возвращается `None`:
+    вызывающий код сохраняет страницу в готовом PDF как исходную графику и
+    продолжает обработку следующей страницы вместо потери всего документа.
+    """
+    image, actual_dpi = render_page(page, args.dpi, args.max_ocr_pixels)
+    try:
+        words = recognize_words(image, args.languages, args.psm, args.timeout)
+        return image, words, actual_dpi, False
+    except RuntimeError as error:
+        if not is_tesseract_timeout(error):
+            image.close()
+            raise
+        logger.warning(
+            "ТАЙМ-АУТ | файл=%s | стр=%d | проход=основной | dpi=%d | повтор=dpi:%d,timeout:%d",
+            source_name,
+            page_number,
+            actual_dpi,
+            args.fallback_dpi,
+            min(args.timeout, DEFAULT_FALLBACK_TIMEOUT),
+        )
+        image.close()
+
+    fallback_image, fallback_actual_dpi = render_page(
+        page, args.fallback_dpi, args.fallback_max_ocr_pixels
+    )
+    try:
+        words = recognize_words(
+            fallback_image,
+            args.languages,
+            args.psm,
+            min(args.timeout, DEFAULT_FALLBACK_TIMEOUT),
+        )
+        logger.info(
+            "ПОВТОР_УСПЕШЕН | файл=%s | стр=%d | dpi=%d",
+            source_name,
+            page_number,
+            fallback_actual_dpi,
+        )
+        return fallback_image, words, fallback_actual_dpi, True
+    except RuntimeError as error:
+        fallback_image.close()
+        if not is_tesseract_timeout(error):
+            raise
+        logger.error(
+            "СТРАНИЦА_БЕЗ_OCR | файл=%s | стр=%d | причина=тайм-аут на основном и повторном проходах | исходная_графика=сохранена",
+            source_name,
+            page_number,
+        )
+        return None, [], fallback_actual_dpi, True
 
 
 def remove_table_lines(image: Image.Image) -> Image.Image:
@@ -517,14 +628,34 @@ def process_pdf(
             raise UserFacingError("PDF защищён паролем и не может быть обработан.")
 
         for page_index, page in enumerate(document):
-            image = render_page(page, args.dpi)
             table_image: Image.Image | None = None
+            image: Image.Image | None = None
             try:
-                primary_words = recognize_words(image, args.languages, args.psm, args.timeout)
+                image, primary_words, used_dpi, fallback_used = recognize_primary_with_recovery(
+                    page, args, input_pdf.name, page_index + 1, logger
+                )
+                if fallback_used:
+                    total.fallback_pages += 1
+                if image is None:
+                    total.pages_without_ocr += 1
+                    continue
+
                 table_image = remove_table_lines(image)
                 # PSM 6 рассматривает очищенную область как единый текстовый блок;
                 # это делает текст внутри ячеек доступным даже при плотной сетке.
-                table_words = recognize_words(table_image, args.languages, 6, args.timeout)
+                try:
+                    table_words = recognize_words(table_image, args.languages, 6, args.table_timeout)
+                except RuntimeError as error:
+                    if not is_tesseract_timeout(error):
+                        raise
+                    table_words = []
+                    total.table_timeouts += 1
+                    logger.warning(
+                        "ТАБЛИЦА_ПРОПУЩЕНА | файл=%s | стр=%d | причина=тайм-аут | dpi=%d | основное_распознавание=сохранено",
+                        input_pdf.name,
+                        page_index + 1,
+                        used_dpi,
+                    )
                 words, recovered = merge_ocr_passes(primary_words, table_words)
                 if recovered:
                     logger.info(
@@ -548,7 +679,8 @@ def process_pdf(
             finally:
                 if table_image is not None:
                     table_image.close()
-                image.close()
+                if image is not None:
+                    image.close()
 
         output_pdf.parent.mkdir(parents=True, exist_ok=True)
         if temp_path.exists():
@@ -572,8 +704,12 @@ def main() -> int:
         raise UserFacingError("Параметр --dpi должен быть в диапазоне от 72 до 600.")
     if not 0 <= args.confidence <= 100:
         raise UserFacingError("Параметр --confidence должен быть в диапазоне от 0 до 100.")
-    if args.timeout < 10:
-        raise UserFacingError("Параметр --timeout должен быть не меньше 10 секунд.")
+    if args.timeout < 10 or args.table_timeout < 10:
+        raise UserFacingError("Параметры --timeout и --table-timeout должны быть не меньше 10 секунд.")
+    if args.max_ocr_pixels < 1_000_000 or args.fallback_max_ocr_pixels < 1_000_000:
+        raise UserFacingError("Ограничения --max-ocr-pixels должны быть не меньше 1 000 000.")
+    if not 72 <= args.fallback_dpi <= args.dpi:
+        raise UserFacingError("Параметр --fallback-dpi должен быть от 72 до значения --dpi.")
 
     source_dir = args.source.expanduser()
     output_dir = args.output.expanduser() if args.output else source_dir / DEFAULT_OUTPUT_NAME
@@ -592,11 +728,13 @@ def main() -> int:
     log_path = output_dir / "ocr.log"
     logger = configure_logging(log_path, args.reset_log)
     logger.info(
-        "СТАРТ | source=%s | output=%s | languages=%s | dpi=%d | confidence=%.1f | tesseract=%s",
+        "СТАРТ | source=%s | output=%s | languages=%s | dpi=%d | max_pixels=%d | fallback_dpi=%d | confidence=%.1f | tesseract=%s",
         source_dir,
         output_dir,
         args.languages,
         args.dpi,
+        args.max_ocr_pixels,
+        args.fallback_dpi,
         args.confidence,
         version,
     )
@@ -619,6 +757,7 @@ def main() -> int:
     print(f"Найдено PDF: {len(pdfs)}. Результаты: {output_dir}")
     succeeded = skipped = failed = 0
     all_pages = all_text = all_table_recovered = all_uncertain = all_formulas = 0
+    all_fallback_pages = all_pages_without_ocr = all_table_timeouts = 0
 
     for number, input_pdf in enumerate(pdfs, start=1):
         output_pdf = destination_for(input_pdf, source_dir, output_dir)
@@ -639,6 +778,9 @@ def main() -> int:
             all_table_recovered += result.recovered_table_words
             all_uncertain += result.uncertain_words
             all_formulas += result.formula_lines
+            all_fallback_pages += result.fallback_pages
+            all_pages_without_ocr += result.pages_without_ocr
+            all_table_timeouts += result.table_timeouts
             logger.info(
                 "ГОТОВО | файл=%s | страниц=%d | слов_слой=%d | таблица_добавлено=%d | неуверенных=%d | формул=%d | секунд=%.1f",
                 input_pdf,
@@ -652,7 +794,9 @@ def main() -> int:
             print(
                 f"    готово: {pages} стр., текстовых слов {result.accepted_words}, "
                 f"добавлено из таблиц {result.recovered_table_words}, "
-                f"неуверенных {result.uncertain_words}, формул {result.formula_lines}"
+                f"повторных проходов {result.fallback_pages}, "
+                f"без OCR {result.pages_without_ocr}, неуверенных {result.uncertain_words}, "
+                f"формул {result.formula_lines}"
             )
         except Exception as exc:  # Обрабатываем следующий PDF даже при ошибке одного файла.
             failed += 1
@@ -660,13 +804,16 @@ def main() -> int:
             print(f"    ошибка: {exc}", file=sys.stderr)
 
     logger.info(
-        "ИТОГ | успешно=%d | пропущено=%d | ошибок=%d | страниц=%d | слов_слой=%d | таблица_добавлено=%d | неуверенных=%d | формул=%d",
+        "ИТОГ | успешно=%d | пропущено=%d | ошибок=%d | страниц=%d | слов_слой=%d | таблица_добавлено=%d | повторных=%d | без_ocr=%d | тайм-аутов_таблиц=%d | неуверенных=%d | формул=%d",
         succeeded,
         skipped,
         failed,
         all_pages,
         all_text,
         all_table_recovered,
+        all_fallback_pages,
+        all_pages_without_ocr,
+        all_table_timeouts,
         all_uncertain,
         all_formulas,
     )
