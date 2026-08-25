@@ -1,0 +1,5 @@
+# Поддерживаемые версии для Windows x64 / Python 3.14
+PyMuPDF>=1.27.0
+Pillow>=12.0.0
+opencv-python-headless>=5.0.0.93
+pytesseract>=0.3.13
